@@ -1,0 +1,198 @@
+---
+title: "Unsupervised Learning for Stroke Prediction"
+author: "Andis Bara"
+output: 
+  html_document:
+    theme: flatly
+    toc: yes
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(dplyr)
+library(FactoMineR)
+library(factoextra)
+```
+
+## Objective and Setup: 
+The goal of this unsupervised learning phase is to discover natural, underlying structures within the patient data without providing the algorithm any prior knowledge of stroke outcomes.
+
+## Factor Analysis of Mixed Data (FAMD)
+
+### Why FAMD:
+
+I selected Factor Analysis of Mixed Data (FAMD) over standard Principal Component Analysis (PCA). Standard PCA is mathematically restricted to continuous numerical variables. Because this dataset contains critical categorical indicators such as marital status, work type, and heart disease relying solely on PCA would mean discarding vital clinical and demographic variance. FAMD allows for simultaneous dimensionality reduction of both continuous and categorical data.
+
+### Data Preparation:
+
+First, the pre cleaned dataset is loaded. To ensure the FactoMineR package executes properly, the target variable (stroke) is removed from the unsupervised training set, and the binary clinical indicators are recoded into mathematically unique strings to avoid row-name duplication errors during projection.
+```{r}
+df_clean <- as.data.frame(readRDS(here::here("data", "processed", "cleaned_stroke_dataset.rds")))
+```
+
+```{r}
+df_unsupervised <- df_clean %>% 
+  select(-stroke) %>%
+  mutate(
+    # Making the binary factor levels mathematically unique so FactoMineR doesn't crash
+    hypertension = as.factor(ifelse(hypertension == "1", "Yes_HT", "No_HT")),
+    heart_disease = as.factor(ifelse(heart_disease == "1", "Yes_HD", "No_HD"))
+  )
+```
+### Model Execution and Variance Visualization:
+
+The FAMD algorithm is applied to the dataset, limiting the extraction to the top 5 principal dimensions.
+```{r}
+famd_result <- FAMD(df_unsupervised, ncp = 5, graph = FALSE)
+
+fviz_famd_var(famd_result, "var", repel = TRUE, 
+              col.var = "contrib", 
+              gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"))
+```
+
+### Determining the Number of Dimensions (Kaiser Rule):
+
+To determine the optimal number of dimensions to retain, I examined the eigenvalues of the principal components. Applying the Kaiser criterion, we look for dimensions with an eigenvalue greater than 1.0.
+
+```{r scree-plot, fig.height=5, fig.width=7}
+library(ggplot2)
+
+# Generate the Scree Plot
+fviz_eig(famd_result, 
+         choice = "eigenvalue", 
+         addlabels = TRUE, 
+         barfill = "#00AFBB", 
+         barcolor = "#00AFBB",
+         linecolor = "red",
+         title = "Scree Plot: Eigenvalues of Principal Dimensions") +
+  
+  # This adds the dashed line at 1.0 to visually prove your Kaiser Rule defense!
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black", linewidth = 1)
+```
+### Patient Clustering Projection:
+
+Next, we project the individual patients onto the newly calculated coordinate plane. By overlaying the true stroke outcomes (which the algorithm was blind to during calculation), we can evaluate if the unsupervised dimensions successfully capture the variance associated with stroke risk.
+
+```{r}
+fviz_famd_ind(famd_result, 
+              geom = "point", 
+              habillage = as.factor(df_clean$stroke), 
+              palette = c("grey", "red"),
+              alpha.ind = 0.4)
+```
+
+### Conclusion and Key Insights:
+
+Using unsupervised Factor Analysis of Mixed Data (FAMD), the algorithm was able to separate the patient population without prior knowledge of their stroke status.
+
+The Variables plot reveals that Dimension 1 is strongly driven by age, marital status, and BMI (demographic and aging factors), while Dimension 2 is driven by cardiovascular indicators like heart disease, smoking, and glucose levels. Crucially, the Individuals plot demonstrates that stroke cases appear more frequently along the positive regions of both dimensions. This confirms that advanced age (Dimension 1), coupled with cardiovascular and lifestyle risk factors (Dimension 2), are the primary structural drivers of variance separating stroke victims from the general population in this dataset.
+
+## 4. K-Means Clustering on Principal Dimensions
+
+### Why?
+
+Because standard K-Means clustering relies on Euclidean distance, it is mathematically invalid to apply it directly to a dataset containing categorical variables. To resolve this, I extracted the numerical coordinates of the patients from the top 5 FAMD dimensions. By applying K-Means to these principal components, the algorithm can effectively cluster the mixed-type data.
+
+```{r kmeans-clustering, fig.height=5, fig.width=7}
+# Extract the numerical coordinates from the FAMD result (Top 5 dimensions)
+famd_coords <- famd_result$ind$coord[, 1:5]
+```
+
+### Choosing k for k-means clustering
+```{r optimal-clusters, fig.height=4, fig.width=6}
+# Calculate and visualize the optimal number of clusters using WSS
+fviz_nbclust(famd_coords, kmeans, method = "wss") +
+  theme_minimal() +
+  labs(title = "Elbow Method for Optimal k",
+       subtitle = "Evaluating Total Within Sum of Square",
+       x = "Number of Clusters (k)", 
+       y = "Total Within Sum of Square (WSS)") +
+  # This adds a professional dashed line highlighting your choice of 3 clusters
+  geom_vline(xintercept = 3, linetype = "dashed", color = "red", linewidth = 1)
+```
+
+### interpretation:
+The resulting plot illustrates a steep decline in the Total Within Sum of Square (WSS) from $k=1$ to $k=3$. Beyond $k=3$, the curve flattens significantly, indicating diminishing returns in variance reduction. Therefore, $k=3$ was selected as the optimal hyperparameter, balancing cluster cohesion with model simplicity.
+
+### Plotting k-means:
+
+```{r}
+# Set a random seed for reproducibility
+set.seed(123)
+
+# Run K-Means Clustering
+# We will test with 3 clusters (k = 3). 
+kmeans_result <- kmeans(famd_coords, centers = 3, nstart = 25)
+
+# Attach the cluster assignments back to our original dataset for later analysis
+df_clean$Cluster <- as.factor(kmeans_result$cluster)
+
+# Visualize the Clusters on the FAMD coordinate plane
+fviz_cluster(kmeans_result, 
+             data = famd_coords,
+             geom = "point",            
+             ellipse.type = "convex",    
+             ellipse.alpha = 0.2,       
+             palette = "Set1",           
+             ggtheme = theme_gray(),     
+             main = "K-Means Patient Clusters") +
+  
+  labs(x = "Dimension 1 (Aging & Demographics Axis)", 
+       y = "Dimension 2 (Cardiovascular & Lifestyle Risk Axis)")
+```
+
+### Conclusion and Key insights:
+
+K-Means clustering was applied to the numerical patient coordinates derived from the FAMD dimensionality reduction. By partitioning patients into three clusters based on Euclidean distance in the reduced feature space, the algorithm identifies groups of individuals with similar demographic and clinical profiles without using the stroke outcome variable.
+
+```{r cluster-summary}
+# Calcsulate clinical profiles for each cluster
+cluster_summary <- df_clean %>%
+  group_by(Cluster) %>%
+  summarise(
+    Total_Patients = n(),
+    Mean_Age = round(mean(age), 0),
+    Mean_Glucose = round(mean(avg_glucose_level), 1),
+    # Convert stroke factor back to numeric 0/1 to calculate the percentage
+    Stroke_Rate_Percent = round(mean(as.numeric(as.character(stroke))) * 100, 2) 
+  )
+
+# Prints a formatted table for the report
+knitr::kable(cluster_summary, caption = "Clinical Profile of Patient Clusters")
+```
+
+```{r cluster-stroke-plot}
+# Visualize Stroke Rate by Cluster
+ggplot(df_clean, aes(x = Cluster, fill = stroke)) +
+  # position = "fill" makes all bars the same height to compare percentages
+  geom_bar(position = "fill") + 
+  scale_y_continuous(labels = scales::percent) +
+  theme_minimal() +
+  scale_fill_manual(values = c("grey", "red"), labels = c("No Stroke", "Stroke")) +
+  labs(title = "Stroke Incidence Rate by Patient Cluster",
+       y = "Percentage of Patients",
+       fill = "Outcome")
+```
+- Cluster 1 – Younger Low-Risk Population
+
+Cluster 1 contains predominantly younger individuals with lower BMI and glucose levels. Cardiovascular conditions are rare in this cluster, and stroke incidence is minimal and rare.
+
+- Cluster 2 – Intermediate Risk Population
+
+Cluster 2 represents middle-aged individuals with moderate metabolic indicators and lower prevalence of cardiovascular conditions. Stroke cases appear less frequently compared to Cluster 3.
+
+- Cluster 3 – High Risk Metabolic Group
+
+Patients in Cluster 3 exhibit the highest average age, elevated glucose levels, and a higher prevalence of hypertension and heart disease. This cluster contains the largest proportion of stroke cases, suggesting that metabolic deterioration and cardiovascular problems characterize this subgroup.
+
+```{r}
+ggplot(df_clean, aes(x = Cluster, fill = Cluster)) +
+  geom_bar() +
+  theme_minimal() +
+  labs(title = "Cluster Sizes in Patient Population")
+```
+The cluster size distribution shows that the majority of patients fall into the middle-aged group (Cluster 2), while younger and elderly populations form smaller subgroups. This reflects the natural demographic composition of the dataset.
