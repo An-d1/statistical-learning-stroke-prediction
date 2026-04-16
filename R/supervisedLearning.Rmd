@@ -18,6 +18,10 @@ library(recipes)
 library(themis)
 library(parsnip)
 library(workflows)
+library(tune)
+library(doParallel)
+library(ggplot2)
+library(yardstick)
 ```
 
 ## Objective and Setup:
@@ -27,7 +31,9 @@ The target outcome needs to be recognized as a classification factor
 ```{r}
 df_clean <- as.data.frame(readRDS(here::here("data", "processed", "cleaned_stroke_dataset.rds")))
 
-df_clean$stroke <- as.factor(df_clean$stroke)
+df_clean$stroke <- factor(df_clean$stroke,
+                          levels = c("1", "0"),
+                          labels = c("Stroke", "No Stroke"))
 
 ```
 
@@ -42,13 +48,15 @@ init_split <- initial_split(df_clean, prop = 0.80, strata = stroke)
 train_df <- training(init_split)
 test_df  <- testing(init_split)
 
+levels(train_df$stroke)
+
 # Printing to verify the imbalance in the training partition
 cat("Original distribution in training data:\n")
 print(table(train_df$stroke))
 ```
 # Resampling the Training Data only:
 
-### Why SMONTENC?
+### Why SMOTENC?
 The dataset contains two highly unbalanced classes, stroke and no stroke. This can create problems when building predictive models, because the model may become biased toward the majority class and predict non-stroke cases most of the time, instead of learning patterns that identify the minority class properly. In this case, that would reduce the usefulness of the model.
 
 To address this issue, a resampling method was needed to generate synthetic observations for the minority class. This gives the model more examples of stroke cases during training and helps it produce more meaningful predictions.
@@ -58,7 +66,8 @@ SMOTENC was chosen instead of SMOTE because the dataset includes both numerical 
 ```{r}
 smote_blueprint <- recipe(stroke ~ ., data = train_df) %>%
   # will be oversampled until it is 25% the size of the majority class.
-  step_smotenc(stroke, over_ratio = 0.25)
+  step_smotenc(stroke, over_ratio = 0.25) %>%
+  step_dummy(all_nominal_predictors())
 
 # Extracting the finalized, balanced dataset to use for model fitting
 train_resampled <- smote_blueprint %>% 
@@ -88,16 +97,28 @@ log_spec <- logistic_reg() %>%
   set_mode("classification")
 ```
 
-- Random Forest spec
+- Random Forest spec:
+We let it search for the optimal number of variables to check 
+at each split (mtry) and the minimum node size (min_n).
 ```{r}
-rf_spec <- rand_forest(trees = 500) %>% 
+rf_tune_spec <- rand_forest(
+  mtry = tune(),      
+  min_n = tune(),     
+  trees = 500         
+) %>% 
   set_engine("ranger", importance = "impurity") %>% 
   set_mode("classification")
 ```
 
-- XGboost spec
+- XGboost spec:
+We let it search for tree depth, learning rate, and node size.
 ```{r}
-xgb_spec <- boost_tree() %>% 
+xgb_tune_spec <- boost_tree(
+  tree_depth = tune(), 
+  learn_rate = tune(), 
+  min_n = tune(),
+  trees = 500
+) %>% 
   set_engine("xgboost") %>% 
   set_mode("classification")
 ```
@@ -123,14 +144,292 @@ log_workflow <- workflow() %>%
 ```{r}
 rf_workflow <- workflow() %>%
   add_recipe(smote_blueprint) %>%
-  add_model(rf_spec)
+  add_model(rf_tune_spec)
 ```
 
 - XGBoost pipeline
 ```{r}
 xgb_workflow <- workflow() %>%
   add_recipe(smote_blueprint) %>%
-  add_model(xgb_spec)
+  add_model(xgb_tune_spec)
 ```
 
+# Parameter tuning
 
+- Parallel processing is used to take advantage of multi-cores which allows for faster training time.
+
+```{r parameter-tuning, cache = TRUE}
+# Leaving one core free 
+registerDoParallel(cores = parallel::detectCores() - 1) 
+
+# Logistic regression doesn't need tuning, we just fit it directly to the folds
+cat("Fitting Logistic Regression...\n")
+log_results <- fit_resamples(
+log_workflow,
+resamples = cv_folds,
+control = control_resamples(save_pred = TRUE)
+)
+
+# Tune Random Forest
+cat("Tuning Random Forest...\n")
+set.seed(345)
+rf_tune_results <- tune_grid(
+rf_workflow,
+resamples = cv_folds,
+grid = 10 
+)
+
+# Tune XGBoost
+cat("Tuning XGBoost...\n")
+set.seed(456)
+xgb_tune_results <- tune_grid(
+xgb_workflow,
+resamples = cv_folds,
+grid = 10 
+)
+
+# Shut down the parallel processing when done
+stopImplicitCluster()
+```
+
+# Evaluating Model Performance
+
+Now that the grid search is complete, we can visualize how the different hyperparameter combinations affected the performance of our tree-based models, and extract the optimal settings for each algorithm based on the Area Under the Curve (ROC-AUC).
+
+```{r}
+# Visualizing the tuning grids
+autoplot(rf_tune_results) + 
+  theme_minimal() + 
+  labs(title = "Random Forest: Hyperparameter Tuning Results")
+
+autoplot(xgb_tune_results) + 
+  theme_minimal() + 
+  labs(title = "XGBoost: Hyperparameter Tuning Results")
+
+# Extracting the highest ROC-AUC scores for each model
+cat(" Best Logistic Regression ---\n")
+print(collect_metrics(log_results) %>% filter(.metric == "roc_auc"))
+
+cat("\n Best Random Forest \n")
+print(show_best(rf_tune_results, metric = "roc_auc", n = 1))
+
+cat("\n Best XGBoost \n")
+print(show_best(xgb_tune_results, metric = "roc_auc", n = 1))
+```
+
+```{r}
+# Logistic Regression
+set.seed(123)
+log_compare_results <- fit_resamples(
+  log_workflow,
+  resamples = cv_folds,
+  metrics = metric_set(accuracy, sens, spec)
+)
+
+# Random Forest
+best_rf_params <- select_best(rf_tune_results, metric = "roc_auc")
+final_rf_workflow <- finalize_workflow(rf_workflow, best_rf_params)
+
+set.seed(123)
+rf_compare_results <- fit_resamples(
+  final_rf_workflow,
+  resamples = cv_folds,
+  metrics = metric_set(accuracy, sens, spec)
+)
+
+# XGBoost
+best_xgb_params <- select_best(xgb_tune_results, metric = "roc_auc")
+final_xgb_workflow <- finalize_workflow(xgb_workflow, best_xgb_params)
+
+set.seed(123)
+xgb_compare_results <- fit_resamples(
+  final_xgb_workflow,
+  resamples = cv_folds,
+  metrics = metric_set(accuracy, sens, spec)
+)
+
+# Combine all three
+compare_df <- bind_rows(
+  collect_metrics(log_compare_results) %>% mutate(Model = "Logistic Regression"),
+  collect_metrics(rf_compare_results) %>% mutate(Model = "Random Forest"),
+  collect_metrics(xgb_compare_results) %>% mutate(Model = "XGBoost")
+) %>%
+  filter(.metric %in% c("accuracy", "sens", "spec")) %>%
+  mutate(
+    Metric = recode(.metric,
+      accuracy = "Overall Accuracy",
+      sens = "Sensitivity\n(Stroke)",
+      spec = "Specificity\n(No Stroke)"
+    )
+  )
+
+# Plot
+ggplot(compare_df, aes(x = Metric, y = mean, fill = Model)) +
+  geom_col(position = "dodge", color = "black", alpha = 0.85) +
+  geom_text(
+    aes(label = round(mean, 3)),
+    position = position_dodge(width = 0.9),
+    vjust = -0.5,
+    size = 4
+  ) +
+  scale_fill_manual(values = c(
+    "Logistic Regression" = "#e74c3c",
+    "Random Forest" = "#2c3e50",
+    "XGBoost" = "#27ae60"
+  )) +
+  theme_minimal() +
+  labs(
+    title = "Model Comparison",
+    subtitle = "Cross-validated performance on the resampled training data",
+    x = NULL,
+    y = "Cross-Validated Score",
+    fill = "Model"
+  ) +
+  coord_cartesian(ylim = c(0, 1.1))
+```
+
+### Interpretation:
+
+- Even though the charts show that Random Forest and XGBoost were able to achieve better overall accuracy & and slightly better specificity, it is practically useless in terms of sensitivity with only 8.8% % 3% respectively "detection rate".
+
+- On the other hand Logistic Regression was able to achieve a much higher sensitivity of 40.8% at the cost of a slight overall accuracy drop (3.9%) & slight specificity drop (5.8%).
+
+- In the context of medical prediction, this is a major improvement because we are more willing to accept additional false positives in exchange for far fewer false negatives.
+
+# Justifying the use of re-sampling for Logistic Regression
+
+```{r}
+# Creating a blueprint with no resampling simmilarly to the resampled one
+unsampled_blueprint <- recipe(stroke ~ ., data = train_df) %>%
+  step_dummy(all_nominal_predictors())
+
+# Building a workflow using an unsampled Logistic Regression specification
+unsampled_log_workflow <- workflow() %>%
+  add_recipe(unsampled_blueprint) %>%
+  add_model(log_spec)
+
+# Fitting it to the exact same cross-validation folds to ensure a fair comparison
+set.seed(999)
+unsampled_log_results <- fit_resamples(
+  unsampled_log_workflow,
+  resamples = cv_folds,
+  # collecting sensitivity and specifity
+  metrics = metric_set(roc_auc, accuracy, sens, spec)
+)
+
+library(dplyr)
+library(ggplot2)
+
+# Combine sampled and unsampled Logistic Regression results
+log_resampling_compare_df <- bind_rows(
+  collect_metrics(log_compare_results) %>% mutate(Model = "Sampled (SMOTENC)"),
+  collect_metrics(unsampled_log_results) %>% mutate(Model = "Unsampled (Raw Data)")
+) %>%
+  filter(.metric %in% c("accuracy", "sens", "spec")) %>%
+  mutate(
+    Metric = recode(.metric,
+      accuracy = "Overall Accuracy",
+      sens = "Sensitivity\n(Stroke)",
+      spec = "Specificity\n(No Stroke)"
+    )
+  )
+
+# Plot
+ggplot(log_resampling_compare_df, aes(x = Metric, y = mean, fill = Model)) +
+  geom_col(position = "dodge", color = "black", alpha = 0.85) +
+  geom_text(
+    aes(label = round(mean, 3)),
+    position = position_dodge(width = 0.9),
+    vjust = -0.5,
+    size = 4
+  ) +
+  scale_fill_manual(values = c(
+    "Sampled (SMOTENC)" = "#2c3e50",
+    "Unsampled (Raw Data)" = "#e74c3c"
+  )) +
+  theme_minimal() +
+  labs(
+    title = "Logistic Regression: Unsampled vs. SMOTENC Resampling",
+    subtitle = "Cross-validated performance before and after class balancing",
+    x = NULL,
+    y = "Cross-Validated Score",
+    fill = "Training Data"
+  ) +
+  coord_cartesian(ylim = c(0, 1.1))
+```
+
+### Interpretation:
+
+- This comparison shows why resampling was necessary. The unsampled model appeared to perform very well, with nearly perfect accuracy and specificity, but this result was misleading because it was mostly predicting “No Stroke,” the majority class, rather than learning to detect actual stroke cases.
+
+```{r fig.width=10, fig.height=6}
+
+# Fit logistic regression once on the training data
+final_log_fit <- fit(log_workflow, data = train_df)
+
+# Get predicted probabilities on the test set
+log_probs <- predict(final_log_fit, test_df, type = "prob") %>%
+  bind_cols(test_df %>% select(stroke))
+
+# Thresholds to compare
+thresholds_to_compare <- c(0.30, 0.20, 0.15)
+
+# Build a table with accuracy, sensitivity, and specificity for each threshold
+threshold_compare_df <- bind_rows(lapply(thresholds_to_compare, function(th) {
+  
+  preds <- log_probs %>%
+    mutate(
+      .pred_class = if_else(.pred_Stroke >= th, "Stroke", "No Stroke"),
+      .pred_class = factor(.pred_class, levels = levels(stroke))
+    )
+  
+  acc_df <- accuracy(preds, truth = stroke, estimate = .pred_class) %>%
+    transmute(
+      Threshold = paste0("t = ", th),
+      Metric = "Overall Accuracy",
+      Score = .estimate
+    )
+  
+  sens_df <- sens(preds, truth = stroke, estimate = .pred_class) %>%
+    transmute(
+      Threshold = paste0("t = ", th),
+      Metric = "Sensitivity\n(Stroke)",
+      Score = .estimate
+    )
+  
+  spec_df <- spec(preds, truth = stroke, estimate = .pred_class) %>%
+    transmute(
+      Threshold = paste0("t = ", th),
+      Metric = "Specificity\n(No Stroke)",
+      Score = .estimate
+    )
+  
+  bind_rows(acc_df, sens_df, spec_df)
+}))
+
+# Plot side by side
+ggplot(threshold_compare_df, aes(x = Metric, y = Score, fill = Threshold)) +
+  geom_col(position = "dodge", color = "black", alpha = 0.85) +
+  geom_text(
+    aes(label = round(Score, 3)),
+    position = position_dodge(width = 0.9),
+    vjust = -0.5,
+    size = 4
+  ) +
+  scale_fill_manual(values = c(
+    "t = 0.3" = "#2c3e50",
+    "t = 0.2" = "#e74c3c",
+    "t = 0.15" = "#27ae60"
+  )) +
+  theme_minimal() +
+  labs(
+    title = "Logistic Regression Performance at Different Thresholds",
+    subtitle = "Comparing overall accuracy, sensitivity, and specificity",
+    x = NULL,
+    y = "Performance Score",
+    fill = "Threshold"
+  ) +
+  coord_cartesian(ylim = c(0, 1.1))
+```
+
+- This comparison shows that when the threshold is lowered, the model becomes better at catching stroke cases, since sensitivity goes up. At the same time, overall accuracy and specificity go down. So in the end, the threshold should be chosen depending on what is more important: keeping the model more balanced overall, or making sure that more stroke cases are detected.
