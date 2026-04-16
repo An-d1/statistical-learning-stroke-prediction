@@ -1,0 +1,136 @@
+---
+title: "Supervised Learning"
+author: "Andis Bara"
+output: 
+  html_document:
+    theme: flatly
+    toc: yes
+    toc_float: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(rsample)
+library(recipes)
+library(themis)
+library(parsnip)
+library(workflows)
+```
+
+## Objective and Setup:
+The goal of this supervised learning phase is to build predictive models that classify patients according to whether they are likely to experience a stroke based on their charachteristics and different factors.
+
+The target outcome needs to be recognized as a classification factor
+```{r}
+df_clean <- as.data.frame(readRDS(here::here("data", "processed", "cleaned_stroke_dataset.rds")))
+
+df_clean$stroke <- as.factor(df_clean$stroke)
+
+```
+
+Isolating the Test Data and setting a seed
+
+```{r}
+set.seed(4092) 
+
+# Stratified split that ensures the tiny percentage of stroke cases is distributed evenly
+init_split <- initial_split(df_clean, prop = 0.80, strata = stroke)
+
+train_df <- training(init_split)
+test_df  <- testing(init_split)
+
+# Printing to verify the imbalance in the training partition
+cat("Original distribution in training data:\n")
+print(table(train_df$stroke))
+```
+# Resampling the Training Data only:
+
+### Why SMONTENC?
+The dataset contains two highly unbalanced classes, stroke and no stroke. This can create problems when building predictive models, because the model may become biased toward the majority class and predict non-stroke cases most of the time, instead of learning patterns that identify the minority class properly. In this case, that would reduce the usefulness of the model.
+
+To address this issue, a resampling method was needed to generate synthetic observations for the minority class. This gives the model more examples of stroke cases during training and helps it produce more meaningful predictions.
+
+SMOTENC was chosen instead of SMOTE because the dataset includes both numerical and categorical variables. Since some predictors are categorical, SMOTENC is the more suitable method for the resampling step.
+
+```{r}
+smote_blueprint <- recipe(stroke ~ ., data = train_df) %>%
+  # will be oversampled until it is 25% the size of the majority class.
+  step_smotenc(stroke, over_ratio = 0.25)
+
+# Extracting the finalized, balanced dataset to use for model fitting
+train_resampled <- smote_blueprint %>% 
+  prep() %>% 
+  juice()
+
+cat("\nNew distribution after SMOTENC:\n")
+print(table(train_resampled$stroke))
+```
+
+# Model Selection
+
+For prediction I will be using: Logistic Regression, Random Forest & XGboosting.
+-Why?
+
+- Logistic Regression is used because it is one of the best methods for binary classification problems. It also allows for easier interpretability, which is important in this context.
+
+- Random Forest was chosen because of it's ability to capture non-linear relationships better than Logistic Regression It is also more robust than a single decision tree and usually performs well in classification tasks.
+
+- XGboost was included as a more advanced model, since it often gives strong predictive results on structured datasets.
+
+### Preparing the models
+- Logistic Regression spec
+```{r}
+log_spec <- logistic_reg() %>% 
+  set_engine("glm") %>% 
+  set_mode("classification")
+```
+
+- Random Forest spec
+```{r}
+rf_spec <- rand_forest(trees = 500) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("classification")
+```
+
+- XGboost spec
+```{r}
+xgb_spec <- boost_tree() %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+```
+
+### Cross-Validation Setup
+
+Stratifying so the folds have a realistic number of stroke cases.
+```{r}
+set.seed(2026)
+
+cv_folds <- vfold_cv(train_df, v = 5, strata = stroke)
+cat("Successfully created 5 cross-validation folds.\n")
+```
+
+- Logistic Regression pipeline
+```{r}
+log_workflow <- workflow() %>%
+  add_recipe(smote_blueprint) %>%
+  add_model(log_spec)
+```
+
+- Random Forest pipeline
+```{r}
+rf_workflow <- workflow() %>%
+  add_recipe(smote_blueprint) %>%
+  add_model(rf_spec)
+```
+
+- XGBoost pipeline
+```{r}
+xgb_workflow <- workflow() %>%
+  add_recipe(smote_blueprint) %>%
+  add_model(xgb_spec)
+```
+
+
