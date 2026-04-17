@@ -392,7 +392,7 @@ ggplot(compare_df, aes(x = Metric, y = mean, fill = Model)) +
 
 ### Interpretation:
 
-- From this chart we can see that tuning the hyperparameters for the metrics that matter in this case (sensitivity) forced the tree-based models to focus on paying attetntion to the stroke patients and avoid predicting "no-stroke" 100% of the time so to achieve better overall accuracy.
+- From this chart we can see that tuning the hyperparameters for the metrics that matter in this case sensitivity, forced the tree-based models to focus on paying attetntion to the stroke patients and avoid predicting "no-stroke" 100% of the time so to achieve better overall accuracy.
 
 - Even though we were able to significantly boost the sensitivity of random forest and XGBoost, from 8.8% to 22.9% & from 3% to 26% respectively, logistic regression is still the clear winner with 40.8% accuracy and a very small not significant drop in overall accuracy and specificity.
 
@@ -463,6 +463,10 @@ ggplot(log_resampling_compare_df, aes(x = Metric, y = mean, fill = Model)) +
 - This comparison shows why resampling was necessary. The unsampled model appeared to perform very well, with nearly perfect accuracy and specificity, but this result was misleading because it was mostly predicting “No Stroke,” the majority class, rather than learning to detect actual stroke cases.
 
 # Adjusting probability decision threshold
+
+- One important thing is the probability threshold that basically determines when the model should flag a patient for stroke.
+- In the examples below we show that decreasing the required probability to flag patients, actually increases the sensitivity and misses less actual stroke patients. Of course this does not mean that the model improved, because we have more false-positive cases now but, in most medical cases this is the better alternative and usually the "safest" option.
+- This threshold can be adjusted based on what the hospital prioritizes.
 
 ```{r fig.width=10, fig.height=6}
 
@@ -535,3 +539,50 @@ ggplot(threshold_compare_df, aes(x = Metric, y = Score, fill = Threshold)) +
 ```
 
 - This comparison shows that when the threshold is lowered, the model becomes better at catching stroke cases, since sensitivity goes up. At the same time, overall accuracy and specificity go down. So in the end, the threshold should be chosen depending on what is more important: keeping the model more balanced overall, or making sure that more stroke cases are detected.
+
+# Final Evaluation on the Test Set
+
+```{r}
+# Generate predicted probabilities on the completely unseen test set
+test_probs <- predict(final_log_fit, test_df, type = "prob") %>%
+  bind_cols(test_df %>% select(stroke))
+
+# Apply chosen threshold (using 0.15 based on the previous analysis)
+chosen_threshold <- 0.15
+
+final_test_preds <- test_probs %>%
+  mutate(
+    .pred_class = if_else(.pred_Stroke >= chosen_threshold, "Stroke", "No Stroke"),
+    .pred_class = factor(.pred_class, levels = levels(stroke))
+  )
+
+# Calculate final performance metrics
+final_metrics <- bind_rows(
+  accuracy(final_test_preds, truth = stroke, estimate = .pred_class),
+  sens(final_test_preds, truth = stroke, estimate = .pred_class),
+  spec(final_test_preds, truth = stroke, estimate = .pred_class)
+) %>%
+  select(.metric, .estimate) %>%
+  mutate(Metric = recode(.metric, 
+                         accuracy = "Overall Accuracy", 
+                         sens = "Sensitivity", 
+                         spec = "Specificity"))
+
+cat("Final Model Performance on Unseen Test Data \n")
+print(final_metrics)
+
+# confusion matrix to visualize the exact classification counts
+conf_mat(final_test_preds, truth = stroke, estimate = .pred_class) %>%
+  autoplot(type = "heatmap") +
+  theme_minimal() +
+  scale_fill_gradient(low = "#fdf6f5", high = "#e74c3c") +
+  labs(
+    title = "Final Confusion Matrix (Test Set)", 
+    subtitle = paste("Logistic Regression at Threshold =", chosen_threshold)
+  )
+```
+
+### Final Interpretation
+Looking at the final confusion matrix, the decision to lower the probability threshold to 0.15 paid off for our main objective. The model successfully caught 35 out of the 44 actual stroke cases in the test set, resulting in a final sensitivity of roughly 79.5%.
+
+We did end up with a high number of false positives (324 patients flagged incorrectly), which obviously drags down the overall accuracy and specificity. However, from a health economics and clinical standpoint, this is the exact trade-off we want to make. The medical and financial burden of a missed stroke diagnosis (the 9 false negatives) is massive compared to the relatively low cost of running a few extra preventative screenings on healthy patients. Overall, this makes the logistic regression model a highly effective, cautious first-line screening tool.
