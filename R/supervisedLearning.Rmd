@@ -24,7 +24,7 @@ library(ggplot2)
 library(yardstick)
 ```
 
-## Objective and Setup:
+# Objective and Setup:
 The goal of this supervised learning phase is to build predictive models that classify patients according to whether they are likely to experience a stroke based on their charachteristics and different factors.
 
 The target outcome needs to be recognized as a classification factor
@@ -154,11 +154,11 @@ xgb_workflow <- workflow() %>%
   add_model(xgb_tune_spec)
 ```
 
-# Parameter tuning
+# Parameter tuning for (ROC-AUC), only to show that tuning for sensitivity later yields better resulsts
 
 - Parallel processing is used to take advantage of multi-cores which allows for faster training time.
 
-```{r parameter-tuning, cache = TRUE}
+```{r cache = TRUE}
 # Leaving one core free 
 registerDoParallel(cores = parallel::detectCores() - 1) 
 
@@ -190,31 +190,6 @@ grid = 10
 
 # Shut down the parallel processing when done
 stopImplicitCluster()
-```
-
-# Evaluating Model Performance
-
-Now that the grid search is complete, we can visualize how the different hyperparameter combinations affected the performance of our tree-based models, and extract the optimal settings for each algorithm based on the Area Under the Curve (ROC-AUC).
-
-```{r}
-# Visualizing the tuning grids
-autoplot(rf_tune_results) + 
-  theme_minimal() + 
-  labs(title = "Random Forest: Hyperparameter Tuning Results")
-
-autoplot(xgb_tune_results) + 
-  theme_minimal() + 
-  labs(title = "XGBoost: Hyperparameter Tuning Results")
-
-# Extracting the highest ROC-AUC scores for each model
-cat(" Best Logistic Regression ---\n")
-print(collect_metrics(log_results) %>% filter(.metric == "roc_auc"))
-
-cat("\n Best Random Forest \n")
-print(show_best(rf_tune_results, metric = "roc_auc", n = 1))
-
-cat("\n Best XGBoost \n")
-print(show_best(xgb_tune_results, metric = "roc_auc", n = 1))
 ```
 
 ```{r}
@@ -290,11 +265,136 @@ ggplot(compare_df, aes(x = Metric, y = mean, fill = Model)) +
 
 ### Interpretation:
 
-- Even though the charts show that Random Forest and XGBoost were able to achieve better overall accuracy & and slightly better specificity, it is practically useless in terms of sensitivity with only 8.8% % 3% respectively "detection rate".
+- Even though the charts show that Random Forest and XGBoost were able to achieve better overall accuracy & and slightly better specificity, it is practically useless in terms of sensitivity with only 8.8% & 3% respectively "detection rate".
 
 - On the other hand Logistic Regression was able to achieve a much higher sensitivity of 40.8% at the cost of a slight overall accuracy drop (3.9%) & slight specificity drop (5.8%).
 
 - In the context of medical prediction, this is a major improvement because we are more willing to accept additional false positives in exchange for far fewer false negatives.
+
+# Parameter tuning
+
+- Parallel processing is used to take advantage of multi-cores which allows for faster training time.
+
+- Logistic Regression has no parameters to tune. As for random forest & XGBoost, Im tuning both models for sensitivity (otherwise they would just report an 95% accuracy with no recall)
+
+```{r parameter-tuning, cache = TRUE}
+# Leaving one core free 
+registerDoParallel(cores = parallel::detectCores() - 1) 
+
+stroke_metrics <- metric_set(sens, spec, accuracy, roc_auc)
+
+# Logistic regression doesn't need tuning, we just fit it directly to the folds
+cat("Fitting Logistic Regression...\n")
+log_results <- fit_resamples(
+log_workflow,
+resamples = cv_folds,
+control = control_resamples(save_pred = TRUE)
+)
+
+# Tune Random Forest
+cat("Tuning Random Forest...\n")
+set.seed(345)
+rf_tune_sens_results <- tune_grid(
+rf_workflow,
+resamples = cv_folds,
+grid = 10,
+metrics = stroke_metrics # Tuning for senstivity and the other metrics
+)
+
+# Tune XGBoost
+cat("Tuning XGBoost...\n")
+set.seed(456)
+xgb_tune_sens_results <- tune_grid(
+xgb_workflow,
+resamples = cv_folds,
+grid = 10,
+metrics = stroke_metrics # Tuning for senstivity and the other metrics
+)
+
+# Shut down the parallel processing when done
+stopImplicitCluster()
+```
+
+# Evaluating Model Performance
+
+Now that the grid search is complete, we can visualize and compare the performance of our tree-based models with logistic regression.
+
+```{r}
+# Logistic Regression
+set.seed(123)
+log_compare_results <- fit_resamples(
+  log_workflow,
+  resamples = cv_folds,
+  metrics = stroke_metrics
+)
+
+# Random Forest - Extract the hyperparameter combination that yields the highest sensitivity
+best_rf_sens <- select_best(rf_tune_sens_results, metric = "sens")
+final_rf_workflow <- finalize_workflow(rf_workflow, best_rf_sens)
+
+set.seed(123)
+rf_compare_results <- fit_resamples(
+  final_rf_workflow,
+  resamples = cv_folds,
+  metrics = stroke_metrics
+)
+
+# XGBoost - Extract the hyperparameter combination that yields the highest sensitivity
+best_xgb_sens <- select_best(xgb_tune_sens_results, metric = "sens")
+final_xgb_workflow <- finalize_workflow(xgb_workflow, best_xgb_sens)
+
+set.seed(123)
+xgb_compare_results <- fit_resamples(
+  final_xgb_workflow,
+  resamples = cv_folds,
+  metrics = stroke_metrics
+)
+
+# Combine all three
+compare_df <- bind_rows(
+  collect_metrics(log_compare_results) %>% mutate(Model = "Logistic Regression"),
+  collect_metrics(rf_compare_results) %>% mutate(Model = "Random Forest"),
+  collect_metrics(xgb_compare_results) %>% mutate(Model = "XGBoost")
+) %>%
+  filter(.metric %in% c("accuracy", "sens", "spec")) %>%
+  mutate(
+    Metric = recode(.metric,
+      accuracy = "Overall Accuracy",
+      sens = "Sensitivity\n(Stroke)",
+      spec = "Specificity\n(No Stroke)"
+    )
+  )
+
+# Plot
+ggplot(compare_df, aes(x = Metric, y = mean, fill = Model)) +
+  geom_col(position = "dodge", color = "black", alpha = 0.85) +
+  geom_text(
+    aes(label = round(mean, 3)),
+    position = position_dodge(width = 0.9),
+    vjust = -0.5,
+    size = 4
+  ) +
+  scale_fill_manual(values = c(
+    "Logistic Regression" = "#e74c3c",
+    "Random Forest" = "#2c3e50",
+    "XGBoost" = "#27ae60"
+  )) +
+  theme_minimal() +
+  labs(
+    title = "Model Comparison",
+    subtitle = "Cross-validated performance on the resampled training data",
+    x = NULL,
+    y = "Cross-Validated Score",
+    fill = "Model"
+  ) +
+  coord_cartesian(ylim = c(0, 1.1))
+```
+
+### Interpretation:
+
+- From this chart we can see that tuning the hyperparameters for the metrics that matter in this case (sensitivity) forced the tree-based models to focus on paying attetntion to the stroke patients and avoid predicting "no-stroke" 100% of the time so to achieve better overall accuracy.
+
+- Even though we were able to significantly boost the sensitivity of random forest and XGBoost, from 8.8% to 22.9% & from 3% to 26% respectively, logistic regression is still the clear winner with 40.8% accuracy and a very small not significant drop in overall accuracy and specificity.
 
 # Justifying the use of re-sampling for Logistic Regression
 
@@ -361,6 +461,8 @@ ggplot(log_resampling_compare_df, aes(x = Metric, y = mean, fill = Model)) +
 ### Interpretation:
 
 - This comparison shows why resampling was necessary. The unsampled model appeared to perform very well, with nearly perfect accuracy and specificity, but this result was misleading because it was mostly predicting “No Stroke,” the majority class, rather than learning to detect actual stroke cases.
+
+# Adjusting probability decision threshold
 
 ```{r fig.width=10, fig.height=6}
 
