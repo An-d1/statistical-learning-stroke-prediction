@@ -255,7 +255,7 @@ ggplot(compare_df, aes(x = Metric, y = mean, fill = Model)) +
   theme_minimal() +
   labs(
     title = "Model Comparison",
-    subtitle = "Cross-validated performance on the resampled training data",
+    subtitle = "Cross-validated performance on the resampled training data, tuned for ROC-AUC",
     x = NULL,
     y = "Cross-Validated Score",
     fill = "Model"
@@ -382,7 +382,7 @@ ggplot(compare_df, aes(x = Metric, y = mean, fill = Model)) +
   theme_minimal() +
   labs(
     title = "Model Comparison",
-    subtitle = "Cross-validated performance on the resampled training data",
+    subtitle = "Cross-validated performance on the resampled training data, tuned for sensitivity",
     x = NULL,
     y = "Cross-Validated Score",
     fill = "Model"

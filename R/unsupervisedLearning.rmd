@@ -132,14 +132,14 @@ kmeans_result <- kmeans(famd_coords, centers = 3, nstart = 25)
 df_clean$Cluster <- as.factor(kmeans_result$cluster)
 
 # Visualize the Clusters on the FAMD coordinate plane
-fviz_cluster(kmeans_result, 
-             data = famd_coords,
-             geom = "point",            
-             ellipse.type = "convex",    
-             ellipse.alpha = 0.2,       
-             palette = "Set1",           
-             ggtheme = theme_gray(),     
-             main = "K-Means Patient Clusters") +
+fviz_famd_ind(famd_result, 
+              geom = "point", 
+              habillage = df_clean$Cluster, 
+              palette = "Set1",             
+              alpha.ind = 0.4,
+              addEllipses = TRUE,
+              ellipse.type = "convex",
+              title = "K-Means Patient Clusters (Original FAMD Axes)") +
   
   labs(x = "Dimension 1 (Aging & Demographics Axis)", 
        y = "Dimension 2 (Cardiovascular & Lifestyle Risk Axis)")
