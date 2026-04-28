@@ -70,7 +70,6 @@ fviz_eig(famd_result,
          linecolor = "red",
          title = "Scree Plot: Eigenvalues of Principal Dimensions") +
   
-  # This adds the dashed line at 1.0 to visually prove your Kaiser Rule defense!
   geom_hline(yintercept = 1, linetype = "dashed", color = "black", linewidth = 1)
 ```
 ### Patient Clustering Projection:
